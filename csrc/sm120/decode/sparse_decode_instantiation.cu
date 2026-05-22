@@ -2,7 +2,12 @@
 // launch entry point seen by the C++-only api/sparse_decode.cpp.
 
 #include "sm120/decode/sparse_decode.h"
-#include "sm120/decode/sparse_decode_kernel_hmma.cuh"
+
+#ifdef DSV4_ENABLE_SCALAR_REFERENCE_KERNEL
+#include "sm120/decode/sparse_decode_kernel_scalar_ref.cuh"
+#else
+#include "sm120/decode/sparse_decode_kernel.cuh"
+#endif
 
 namespace dsv4_kernel {
 namespace sm120 {

@@ -1,15 +1,66 @@
 // =====================================================================
-// SM_120 sparse decode kernel for DeepSeek-V4-Flash — HMMA-optimized.
+// SM_120 sparse decode kernel for DeepSeek-V4-Flash — SCALAR REFERENCE.
 //
-// This is an optimized version of the original sparse_decode_kernel.cuh
-// that replaces scalar BF16 dot-products with HMMA tensor core instructions
-// (mma.sync.aligned.m16n8k16.f32.bf16.bf16.f32) available on SM_120.
+// This is the original scalar (CUDA-core) implementation preserved for
+// testing and debugging. It must NOT be included in production builds.
+// Use sparse_decode_kernel.cuh (HMMA tensor core version) instead.
 //
-// The HMMA instruction processes a 16×8 output tile at k=16 depth,
-// giving ~16× throughput over the scalar version for the QK^T and P@V
-// matmul steps which dominated 50% of total GPU time.
+// To enable: define DSV4_ENABLE_SCALAR_REFERENCE_KERNEL before including.
+// =====================================================================
+#ifndef DSV4_ENABLE_SCALAR_REFERENCE_KERNEL
+#error "Scalar sparse decode kernel must not be included in production builds. " \
+       "Define DSV4_ENABLE_SCALAR_REFERENCE_KERNEL to use this reference kernel."
+#endif
+
+// =====================================================================
+// Original description:
 //
-// Layout & format unchanged from original — drop-in replacement.
+// Upstream flash_mla.cuda.sparse_decode_fwd only ships SM_90 (WGMMA) and
+// SM_100 (TCGEN05) classes.  RTX Pro 6000 Blackwell Workstation (SM_120)
+// has neither, so we rebuild the kernel using portable CUDA-core BF16
+// dot-products.  We keep the same on-disk packed KV format and query
+// layout as the sglang deepseek_v4 attention backend.
+//
+// DeepSeek-V4-Flash sparse KV layout (sglang "nope_fp8_rope_bf16_pack",
+// flash_mla MODEL1).  Per-page (page_block_size = P = 256):
+//
+//   [0                               ..  P * 576)       nope_rope section
+//       per token:  [0 .. 448)  NoPE FP8 e4m3fn  (448 bytes)
+//                   [448 .. 576) RoPE BF16       (64 * 2 = 128 bytes)
+//
+//   [P * 576                         ..  P * (576+8))   scale section
+//       per token:  8 fp8_e8m0 (== UE8M0) bytes — 7 active + 1 pad
+//                   scale_i = 2^(byte_i - 127)
+//                   scale_i applies to NoPE[i*64 .. (i+1)*64)
+//
+// The tensor passed from sglang has shape (num_pages, P, 1, 584) viewed
+// on top of a (num_pages, page_bytes_padded) uint8/fp8 storage.  The
+// `.view()` shape is cosmetic — the true layout is as above and our
+// kernel reads the raw bytes directly using stride_kv_block (bytes between
+// pages) and the compile-time nope+rope / scale offsets.
+//
+// Q tensor: BF16 [b, s_q, h_q, 512] = [NoPE(448) | RoPE(64)].
+// Output : BF16 [b, s_q, h_q, 512]; in MLA the value block equals the
+// dequantised K row including RoPE (sglang applies the inverse RoPE to
+// the output's trailing 64 elements in a post-processing step).
+//
+// Supported features (V1):
+//   * d_qk = d_v = 512 (448 NoPE + 64 RoPE)
+//   * h_q multiple of BLOCK_M_HEADS = 16; typically 64 per TP shard
+//   * attn_sink, topk_length, extra_k_cache (SWA sidecar)
+//
+// Not yet implemented (surfaced with TORCH_CHECK in api/sparse_decode.cpp):
+//   * split-KV (num_sm_parts > 1)
+//   * s_q > 1  (MTP must be flattened into outer `b`)
+//
+// SMEM budget (per CTA, HEADS_PER_CTA = 16):
+//   sQ        :  16 x 512  BF16 = 16 384 B
+//   sK        :  32 x 512  BF16 = 32 768 B
+//   sP        :  16 x  32  FP32 =  2 048 B
+//   sO        :  16 x 512  FP32 = 32 768 B
+//   running stats / pad                   256 B
+//   ------------------------------------------
+//   total                           ~84 KB  (SM_120: 99 KB/SM)
 // =====================================================================
 #pragma once
 
@@ -32,22 +83,18 @@ static constexpr int HEAD_DIM_ROPE = 64;
 static constexpr int HEAD_DIM_QK   = HEAD_DIM_NOPE + HEAD_DIM_ROPE;  // 512
 static constexpr int HEAD_DIM_V    = HEAD_DIM_QK;                    // 512
 
-static constexpr int QUANT_TILE    = 64;
+static constexpr int QUANT_TILE    = 64;                          // per-scale block
 static constexpr int NUM_ACTIVE_SCALES = HEAD_DIM_NOPE / QUANT_TILE;  // 7
-static constexpr int NUM_SCALE_SLOTS   = 8;
+static constexpr int NUM_SCALE_SLOTS   = 8;                          // 7 + 1 padding
 static constexpr int NOPE_BYTES    = HEAD_DIM_NOPE;                  // 448
 static constexpr int ROPE_BYTES    = HEAD_DIM_ROPE * 2;              // 128
 static constexpr int NOPE_ROPE_BYTES = NOPE_BYTES + ROPE_BYTES;      // 576
+// Per-token bytes as reported by the sglang 4-D tensor (cosmetic view):
 static constexpr int K_BYTES_PER_TOKEN =
     NOPE_ROPE_BYTES + NUM_SCALE_SLOTS;                               // 584
 
 static constexpr int NUM_WARPS     = 4;
 static constexpr int NUM_THREADS   = NUM_WARPS * 32;
-
-// HMMA m16n8k16 constants
-static constexpr int MMA_M = 16;
-static constexpr int MMA_N = 8;
-static constexpr int MMA_K = 16;
 
 // UE8M0 byte -> multiplicative scale.
 __device__ __forceinline__ float ue8m0_to_scale(unsigned char b) {
@@ -66,29 +113,7 @@ __device__ __forceinline__ void fp8x4_to_bf16x4(uint32_t bits, float scale,
     }
 }
 
-// -------------------------------------------------------------------
-// HMMA m16n8k16 wrapper: C += A * B^T
-// A fragment: 4 x uint32 (each uint32 holds 2 bf16 values)
-// B fragment: 2 x uint32
-// C/D fragment: 4 x float
-// -------------------------------------------------------------------
-__device__ __forceinline__ void hmma_m16n8k16_bf16(
-    float &d0, float &d1, float &d2, float &d3,
-    unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
-    unsigned int b0, unsigned int b1,
-    float c0, float c1, float c2, float c3) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-          "r"(b0), "r"(b1),
-          "f"(c0), "f"(c1), "f"(c2), "f"(c3)
-    );
-}
-
 struct SmemLayout {
-    // Q stored in row-major for HMMA A-fragment loading
     __nv_bfloat16 sQ[BLOCK_M_HEADS][HEAD_DIM_QK];   // 16 384 B
     __nv_bfloat16 sK[KV_CHUNK][HEAD_DIM_QK];         // 32 768 B
     float         sP[BLOCK_M_HEADS][KV_CHUNK];       //  2 048 B
@@ -98,13 +123,15 @@ struct SmemLayout {
 };
 
 // -------------------------------------------------------------------
-// Dequantise & load one KV chunk — identical to original
+// Dequantise & load one KV chunk of up to KV_CHUNK tokens into smem.sK
+// as BF16 [KV_CHUNK][512]. `kv_bytes_base` points at the start of the
+// packed KV arena for the current "h_kv" (MQA, h_kv=1).
 // -------------------------------------------------------------------
 __device__ __forceinline__ void load_kv_chunk(
     SmemLayout &smem,
     const uint8_t *kv_bytes_base,
-    int stride_kv_block,
-    int stride_kv_row,
+    int stride_kv_block,      // bytes between pages
+    int stride_kv_row,        // bytes between tokens inside a page
     int page_block_size,
     const int *indices_base,
     int token_offset,
@@ -112,6 +139,7 @@ __device__ __forceinline__ void load_kv_chunk(
     int warp_id, int lane_id) {
 
     for (int t = warp_id; t < KV_CHUNK; t += NUM_WARPS) {
+        // Out-of-range / invalid tokens → zero row so softmax masks them.
         if (t >= valid_tokens) {
             for (int v = lane_id; v < HEAD_DIM_QK; v += 32) {
                 smem.sK[t][v] = __float2bfloat16_rn(0.0f);
@@ -128,13 +156,18 @@ __device__ __forceinline__ void load_kv_chunk(
         int block_idx    = flat_idx / page_block_size;
         int row_in_block = flat_idx % page_block_size;
 
+        // Base of the page (bytes between pages = stride_kv_block).
         const uint8_t *page_base =
             kv_bytes_base +
             static_cast<size_t>(block_idx) * static_cast<size_t>(stride_kv_block);
 
+        // Per-token nope+rope segment (contiguous 576 B per token, within
+        // the page's nope_rope section).
         const uint8_t *tok_nope_rope =
             page_base + static_cast<size_t>(row_in_block) * NOPE_ROPE_BYTES;
 
+        // Scale section starts right after the page_block_size nope+rope
+        // rows.  8 bytes per token (7 active + 1 padding).
         const unsigned char *scales_u8 =
             page_base + static_cast<size_t>(page_block_size) * NOPE_ROPE_BYTES +
             static_cast<size_t>(row_in_block) * NUM_SCALE_SLOTS;
@@ -145,14 +178,16 @@ __device__ __forceinline__ void load_kv_chunk(
             s[i] = ue8m0_to_scale(scales_u8[i]);
         }
 
+        // NoPE dequant: 4 elements / lane / iter, 32 lanes -> 128 elements,
+        // 4 iters = 512; we only need 448 and clip beyond.
         const uint32_t *fp8_words =
             reinterpret_cast<const uint32_t *>(tok_nope_rope);
         #pragma unroll
         for (int iter = 0; iter < 4; ++iter) {
-            int elem_start = iter * 128 + lane_id * 4;
+            int elem_start = iter * 128 + lane_id * 4;   // [0..511]
             if (elem_start >= HEAD_DIM_NOPE) break;
             uint32_t bits = fp8_words[iter * 32 + lane_id];
-            int q_tile = elem_start / QUANT_TILE;
+            int q_tile = elem_start / QUANT_TILE;        // 0..6
             float scale = s[q_tile];
             __nv_bfloat16 out[4];
             fp8x4_to_bf16x4(bits, scale, out);
@@ -165,6 +200,7 @@ __device__ __forceinline__ void load_kv_chunk(
             }
         }
 
+        // RoPE BF16: 64 elements starting at byte 448.
         const __nv_bfloat16 *rope =
             reinterpret_cast<const __nv_bfloat16 *>(tok_nope_rope + NOPE_BYTES);
         if (lane_id * 2 + 1 < HEAD_DIM_ROPE) {
@@ -175,111 +211,7 @@ __device__ __forceinline__ void load_kv_chunk(
 }
 
 // -------------------------------------------------------------------
-// HMMA-based QK^T: compute sP[16][32] = sQ[16][512] × sK[32][512]^T
-// Using mma.sync.aligned.m16n8k16 with warp-level fragment distribution.
-//
-// HMMA m16n8k16 fragment layout (per warp of 32 threads):
-//   A (row-major): threads hold 4 pairs of bf16 values across M=16 rows
-//   B (col-major): threads hold 2 pairs of bf16 values across N=8 cols
-//   C/D: threads hold 4 float accumulators
-//
-// We tile the [16 × 32] output into [16 × 8] HMMA tiles (4 tiles along N).
-// Each tile accumulates over k=0..512 in steps of 16.
-//
-// PTX ISA m16n8k16.row.col fragment mapping (per-warp, 32 lanes):
-//   g = lane_id >> 2   (groupID, 0..7)
-//   t = lane_id & 3    (threadID_in_group, 0..3)
-//
-//   A fragment (row-major sQ[16][K]):
-//     a0 = {sQ[g    ][K0 + 2t],     sQ[g    ][K0 + 2t + 1]}
-//     a1 = {sQ[g + 8][K0 + 2t],     sQ[g + 8][K0 + 2t + 1]}
-//     a2 = {sQ[g    ][K0 + 2t + 8], sQ[g    ][K0 + 2t + 9]}
-//     a3 = {sQ[g + 8][K0 + 2t + 8], sQ[g + 8][K0 + 2t + 9]}
-//
-//   B fragment (row-major sK[N][K], fed as col-major B^T):
-//     b0 = {sK[g][K0 + 2t],     sK[g][K0 + 2t + 1]}
-//     b1 = {sK[g][K0 + 2t + 8], sK[g][K0 + 2t + 9]}
-//     Note: sK N-index = g = lane>>2, NOT lane%4!
-//
-//   D/C output:
-//     d0 = P[g][2t],  d1 = P[g][2t+1],  d2 = P[g+8][2t],  d3 = P[g+8][2t+1]
-// -------------------------------------------------------------------
-__device__ __forceinline__ void hmma_qk_dot(
-    SmemLayout &smem,
-    int heads_this_cta,
-    int valid,
-    float sm_scale,
-    int warp_id, int lane_id) {
-
-    // Each warp handles one N=8 tile of the 32-wide KV dimension.
-    int n_tile = warp_id;  // 0..3
-    int n_base = n_tile * MMA_N;  // 0, 8, 16, 24
-
-    // Lane decomposition per PTX ISA
-    int g = lane_id >> 2;   // 0..7 — maps to M rows (A) and N rows (B)
-    int t = lane_id & 3;    // 0..3 — maps to K position within tile
-
-    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-
-    // Iterate over K=512 in chunks of 16
-    #pragma unroll 4
-    for (int K0 = 0; K0 < HEAD_DIM_QK; K0 += MMA_K) {
-        // A fragment from sQ[16][512]
-        // a0: row g,   K0+2t..2t+1
-        // a1: row g+8, K0+2t..2t+1
-        // a2: row g,   K0+2t+8..2t+9
-        // a3: row g+8, K0+2t+8..2t+9
-        const __nv_bfloat16 *q_g   = smem.sQ[g];
-        const __nv_bfloat16 *q_g8  = (g + 8 < heads_this_cta) ? smem.sQ[g + 8] : smem.sQ[g]; // fallback for partial CTA
-
-        unsigned int a0 = *reinterpret_cast<const unsigned int*>(&q_g [K0 + 2*t]);
-        unsigned int a1 = *reinterpret_cast<const unsigned int*>(&q_g8[K0 + 2*t]);
-        unsigned int a2 = *reinterpret_cast<const unsigned int*>(&q_g [K0 + 2*t + 8]);
-        unsigned int a3 = *reinterpret_cast<const unsigned int*>(&q_g8[K0 + 2*t + 8]);
-
-        // B fragment from sK[32][512] — each warp's N=8 tile starts at n_base
-        // b0: row n_base+g, K0+2t..2t+1
-        // b1: row n_base+g, K0+2t+8..2t+9
-        int b_row = n_base + g;
-        unsigned int b0, b1;
-        if (b_row < KV_CHUNK && b_row < valid) {
-            b0 = *reinterpret_cast<const unsigned int*>(&smem.sK[b_row][K0 + 2*t]);
-            b1 = *reinterpret_cast<const unsigned int*>(&smem.sK[b_row][K0 + 2*t + 8]);
-        } else {
-            b0 = 0;
-            b1 = 0;
-        }
-
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-            : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-              "r"(b0), "r"(b1)
-        );
-    }
-
-    // Write HMMA results to sP[16][32]
-    // d0 = P[g][2t],  d1 = P[g][2t+1],  d2 = P[g+8][2t],  d3 = P[g+8][2t+1]
-    // Map to the warp's N=8 tile: column = n_base + 2t, n_base + 2t + 1
-    // But wait — HMMA output N columns are 0..7 within the tile.
-    // d0 → C[g][2t], d1 → C[g][2t+1] — these are N-local columns 0..7.
-    // In our sP, N-local col j maps to global col n_base + j.
-    int p_col0 = n_base + 2*t;
-    int p_col1 = p_col0 + 1;
-
-    if (g < heads_this_cta) {
-        smem.sP[g][p_col0]     = (p_col0 < valid) ? d0 * sm_scale : -INFINITY;
-        smem.sP[g][p_col1]     = (p_col1 < valid) ? d1 * sm_scale : -INFINITY;
-    }
-    if (g + 8 < heads_this_cta) {
-        smem.sP[g + 8][p_col0] = (p_col0 < valid) ? d2 * sm_scale : -INFINITY;
-        smem.sP[g + 8][p_col1] = (p_col1 < valid) ? d3 * sm_scale : -INFINITY;
-    }
-}
-
-// -------------------------------------------------------------------
-// Main kernel with HMMA optimization
+// Main kernel: Grid = (batch * s_q, ceil(h_q / HEADS_PER_CTA)), block = 128.
 // -------------------------------------------------------------------
 template <int HEADS_PER_CTA = BLOCK_M_HEADS>
 __global__ __launch_bounds__(NUM_THREADS, 2)
@@ -353,14 +285,27 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
                           warp_id, lane_id);
             __syncthreads();
 
-            // --- QK^T using HMMA tensor cores ---
-            hmma_qk_dot(smem, heads_this_cta, valid, params.sm_scale,
-                        warp_id, lane_id);
+            // --- QK^T (CUDA-core; heads<=16, chunk=32, depth=512) ---
+            for (int cell = tid; cell < BLOCK_M_HEADS * KV_CHUNK;
+                 cell += NUM_THREADS) {
+                int h = cell / KV_CHUNK;
+                int k = cell % KV_CHUNK;
+                if (h >= heads_this_cta || k >= valid) {
+                    smem.sP[h][k] = -INFINITY;
+                    continue;
+                }
+                float acc = 0.0f;
+                const __nv_bfloat16 *q_row = smem.sQ[h];
+                const __nv_bfloat16 *k_row = smem.sK[k];
+                #pragma unroll 4
+                for (int d = 0; d < HEAD_DIM_QK; ++d) {
+                    acc += __bfloat162float(q_row[d]) * __bfloat162float(k_row[d]);
+                }
+                smem.sP[h][k] = acc * params.sm_scale;
+            }
             __syncthreads();
 
             // --- Online softmax + P @ V accumulate ---
-            // P@V still uses scalar for now (V dim = 512, accumulated in sO)
-            // TODO: HMMA-ify this step too for additional speedup
             for (int h_local = warp_id; h_local < heads_this_cta;
                  h_local += NUM_WARPS) {
                 float chunk_max = -INFINITY;
