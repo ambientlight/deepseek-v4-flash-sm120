@@ -144,8 +144,58 @@ sparse_decode_fwd(
 
     p.stream = at::cuda::getCurrentCUDAStream();
 
-    // No split-KV in the SM_120 path yet.  Return empty tile scheduler tensors
-    // that match the flash_mla API shape so callers can keep reusing them.
+    // Adaptive split-KV: use more SMs when the base grid is small.
+    Arch arch;
+    int num_head_blocks = (h_q + 15) / 16;
+    int base_ctas = b * s_q * num_head_blocks;
+    int num_sms = arch.num_sms;
+
+    int n_splits = 1;
+    if (s_q == 1 && base_ctas < num_sms && topk >= 32) {
+        int target_ctas = 2 * num_sms;
+        int desired_splits = (target_ctas + base_ctas - 1) / base_ctas;
+        int min_tokens_per_split = 32;  // one KV_CHUNK worth of work
+        int max_splits_by_work = topk / min_tokens_per_split;
+        n_splits = std::min(desired_splits, std::max(max_splits_by_work, 1));
+        n_splits = std::min(n_splits, 128);  // up to 128 splits
+        if (n_splits < 2) n_splits = 1;
+
+        // Cap allocation: o_accum is [n_splits, b*s_q, h_q, d_v] FP32
+        int64_t alloc_bytes = static_cast<int64_t>(n_splits) * b * s_q * h_q * d_v * 4;
+        if (alloc_bytes > 256LL * 1024 * 1024) {
+            // Reduce splits to fit within 256 MB
+            int64_t max_splits = (256LL * 1024 * 1024) / (static_cast<int64_t>(b) * s_q * h_q * d_v * 4);
+            n_splits = static_cast<int>(std::min(max_splits, static_cast<int64_t>(32)));
+            if (n_splits < 2) n_splits = 1;
+        }
+    }
+
+    p.num_sm_parts = n_splits;
+
+    // Allocate split-KV accumulators if needed
+    at::Tensor lse_accum_tensor, o_accum_tensor;
+    if (n_splits > 1) {
+        int bs = b * s_q;
+        lse_accum_tensor = at::empty({n_splits, bs, h_q}, opts.dtype(at::kFloat));
+        o_accum_tensor = at::empty({n_splits, bs, h_q, d_v}, opts.dtype(at::kFloat));
+        p.lse_accum = lse_accum_tensor.data_ptr<float>();
+        p.o_accum = o_accum_tensor.data_ptr<float>();
+        p.stride_lse_accum_split = bs * h_q;
+        p.stride_lse_accum_s_q = h_q;
+        p.stride_o_accum_split = bs * h_q * d_v;
+        p.stride_o_accum_s_q = h_q * d_v;
+        p.stride_o_accum_h_q = d_v;
+    } else {
+        p.lse_accum = nullptr;
+        p.o_accum = nullptr;
+        p.stride_lse_accum_split = 0;
+        p.stride_lse_accum_s_q = 0;
+        p.stride_o_accum_split = 0;
+        p.stride_o_accum_s_q = 0;
+        p.stride_o_accum_h_q = 0;
+    }
+
+    // Tile scheduler metadata (API parity with flash_mla)
     if (!tile_scheduler_metadata.has_value()) {
         tile_scheduler_metadata =
             at::empty({1, DecodingSchedMetaSize / 4}, opts.dtype(at::kInt));
@@ -154,10 +204,8 @@ sparse_decode_fwd(
     p.tile_scheduler_metadata_ptr =
         reinterpret_cast<DecodingSchedMeta *>(
             tile_scheduler_metadata->data_ptr());
-    p.num_splits_ptr = num_splits->data_ptr<int>();
-    p.num_sm_parts = 1;
+    p.num_splits_ptr = num_splits.has_value() ? num_splits->data_ptr<int>() : nullptr;
 
-    Arch arch;
     if (arch.is_sm120() || std::getenv("DSV4_KERNEL_FORCE") != nullptr) {
         sm120::launch_dsv4_sparse_decode_v32(p);
     } else {

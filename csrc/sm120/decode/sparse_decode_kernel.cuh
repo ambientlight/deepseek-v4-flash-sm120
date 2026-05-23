@@ -337,7 +337,13 @@ __device__ __forceinline__ void hmma_pv_accum_reg(
 }
 
 // -------------------------------------------------------------------
-// Main kernel — register-resident O, targeting occupancy=2.
+// Main kernel — register-resident O, split-KV support.
+//
+// Grid: (b*s_q, head_groups, num_sm_parts)
+// When num_sm_parts > 1, each CTA processes a slice of topk tokens
+// and writes partial O/LSE to o_accum/lse_accum. A separate combine
+// kernel merges the results.
+// When num_sm_parts == 1, behaves as before (full output).
 // -------------------------------------------------------------------
 template <int HEADS_PER_CTA = BLOCK_M_HEADS>
 __global__ __launch_bounds__(NUM_THREADS, 2)
@@ -347,6 +353,7 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
 
     const int bs_s_q    = blockIdx.x;
     const int head_bk   = blockIdx.y;
+    const int split_idx = (params.num_sm_parts > 1) ? blockIdx.z : 0;
     const int batch_idx = bs_s_q / params.s_q;
     const int s_q_idx   = bs_s_q % params.s_q;
     const int head_base = head_bk * HEADS_PER_CTA;
@@ -372,6 +379,26 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
         if (my_extra_topk < 0) my_extra_topk = 0;
     }
 
+    // Split-KV: compute this CTA's token range
+    const int num_splits = params.num_sm_parts;
+    int split_start_main = 0, split_end_main = my_topk;
+    int split_start_extra = 0, split_end_extra = my_extra_topk;
+
+    if (num_splits > 1) {
+        // Split main KV tokens evenly (rounded to KV_CHUNK for efficiency)
+        int total_main = my_topk;
+        int tokens_per_split = ((total_main + num_splits - 1) / num_splits + KV_CHUNK - 1)
+                                / KV_CHUNK * KV_CHUNK;
+        split_start_main = min(split_idx * tokens_per_split, total_main);
+        split_end_main   = min(split_start_main + tokens_per_split, total_main);
+
+        // Extra KV: only processed by split 0 (typically small)
+        if (split_idx > 0) {
+            split_start_extra = 0;
+            split_end_extra = 0;
+        }
+    }
+
     // ---- Register-resident O accumulators ----
     float o0[V_TILES_PER_WARP], o1[V_TILES_PER_WARP];
     float o2[V_TILES_PER_WARP], o3[V_TILES_PER_WARP];
@@ -380,7 +407,6 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
         o0[i] = 0.0f; o1[i] = 0.0f; o2[i] = 0.0f; o3[i] = 0.0f;
     }
 
-    // Register-resident row stats
     float row_max_g  = -INFINITY, row_sum_g  = 0.0f;
     float row_max_g8 = -INFINITY, row_sum_g8 = 0.0f;
 
@@ -410,11 +436,11 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
 
     auto process = [&](const uint8_t *kv_bytes_base, int stride_block,
                         int stride_row, int page_block,
-                        const int *idx_base, int total_tokens) {
-        if (total_tokens <= 0 || idx_base == nullptr) return;
-        for (int token_offset = 0; token_offset < total_tokens;
+                        const int *idx_base, int start_token, int end_token) {
+        if (end_token <= start_token || idx_base == nullptr) return;
+        for (int token_offset = start_token; token_offset < end_token;
              token_offset += KV_CHUNK) {
-            int valid = min(KV_CHUNK, total_tokens - token_offset);
+            int valid = min(KV_CHUNK, end_token - token_offset);
 
             load_kv_chunk(smem, kv_bytes_base, stride_block, stride_row,
                           page_block, idx_base, token_offset, valid,
@@ -437,98 +463,100 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
         }
     };
 
+    // Process this split's token range
     process(reinterpret_cast<const uint8_t *>(params.kv),
             params.stride_kv_block, params.stride_kv_row,
-            params.page_block_size, indices_base, my_topk);
-    if (params.extra_kv)
+            params.page_block_size, indices_base,
+            split_start_main, split_end_main);
+    if (params.extra_kv && split_end_extra > split_start_extra)
         process(reinterpret_cast<const uint8_t *>(params.extra_kv),
                 params.stride_extra_kv_block, params.stride_extra_kv_row,
                 params.extra_page_block_size, extra_indices_base,
-                my_extra_topk);
+                split_start_extra, split_end_extra);
 
-    // --- Epilogue: normalize + sink + writeback from registers ---
-    bool has_sink = params.attn_sink != nullptr;
+    // --- Epilogue ---
+    if (num_splits > 1) {
+        // Split mode: write NORMALIZED partial O + LSE to accum buffers.
+        // o_accum = partial_o / local_sum  (locally normalized)
+        // lse_accum = log(local_sum) + local_max
+        // Combine kernel uses: out = (1/Z) * sum_s exp(lse_s - m) * o_accum_s
+        // where Z = sum_s exp(lse_s - m), m = max(lse_s)
+        auto write_partial = [&](int h, float rmax, float rsum,
+                                 float *oa, float *ob) {
+            if (h >= heads_this_cta) return;
+            float lse_val = (rsum > 0.0f) ? (logf(rsum) + rmax) : -INFINITY;
+            float inv_sum = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
 
-    // Row g
-    if (g < heads_this_cta) {
-        float rmax = row_max_g, rsum = row_sum_g;
-        float sink_val = has_sink ? params.attn_sink[head_base + g] : 0.0f;
-        float lse_val;
-        float norm_factor;
-
-        if (rsum == 0.0f) {
-            lse_val = has_sink ? sink_val : -INFINITY;
-            norm_factor = 0.0f;
-        } else {
-            float log_sum = logf(rsum) + rmax;
-            if (has_sink) {
-                float ss = 1.0f / (1.0f + __expf(sink_val - log_sum));
-                norm_factor = ss / rsum;
-                float m = fmaxf(log_sum, sink_val);
-                lse_val = m + logf(__expf(log_sum - m) + __expf(sink_val - m));
-            } else {
-                norm_factor = 1.0f / rsum;
-                lse_val = log_sum;
+            // Write LSE: use t==0 (one writer per group of 4 lanes sharing same g)
+            if (t == 0) {
+                params.lse_accum[split_idx * params.stride_lse_accum_split +
+                                bs_s_q * params.stride_lse_accum_s_q +
+                                head_base + h] = lse_val;
             }
-        }
 
-        if (lane_id == 0)
-            params.lse[static_cast<size_t>(batch_idx) * params.stride_lse_b +
-                       s_q_idx * params.stride_lse_s_q + head_base + g] = lse_val;
+            // Write locally-normalized O
+            float *o_row = params.o_accum +
+                split_idx * params.stride_o_accum_split +
+                bs_s_q * params.stride_o_accum_s_q +
+                (head_base + h) * params.stride_o_accum_h_q;
 
-        cutlass::bfloat16_t *out_row =
-            params.out + static_cast<size_t>(batch_idx) * params.stride_o_b +
-            s_q_idx * params.stride_o_s_q + (head_base + g) * params.stride_o_h_q;
-
-        #pragma unroll
-        for (int i = 0; i < V_TILES_PER_WARP; ++i) {
-            int v_base = (warp_id + i * NUM_WARPS) * MMA_N;
-            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t]     =
-                __float2bfloat16_rn(o0[i] * norm_factor);
-            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t + 1] =
-                __float2bfloat16_rn(o1[i] * norm_factor);
-        }
-    }
-
-    // Row g+8
-    if (g + 8 < heads_this_cta) {
-        float rmax = row_max_g8, rsum = row_sum_g8;
-        float sink_val = has_sink ? params.attn_sink[head_base + g + 8] : 0.0f;
-        float lse_val;
-        float norm_factor;
-
-        if (rsum == 0.0f) {
-            lse_val = has_sink ? sink_val : -INFINITY;
-            norm_factor = 0.0f;
-        } else {
-            float log_sum = logf(rsum) + rmax;
-            if (has_sink) {
-                float ss = 1.0f / (1.0f + __expf(sink_val - log_sum));
-                norm_factor = ss / rsum;
-                float m = fmaxf(log_sum, sink_val);
-                lse_val = m + logf(__expf(log_sum - m) + __expf(sink_val - m));
-            } else {
-                norm_factor = 1.0f / rsum;
-                lse_val = log_sum;
+            #pragma unroll
+            for (int i = 0; i < V_TILES_PER_WARP; ++i) {
+                int v_base = (warp_id + i * NUM_WARPS) * MMA_N;
+                o_row[v_base + 2*t]     = oa[i] * inv_sum;
+                o_row[v_base + 2*t + 1] = ob[i] * inv_sum;
             }
-        }
+        };
 
-        if (lane_id == 0)
-            params.lse[static_cast<size_t>(batch_idx) * params.stride_lse_b +
-                       s_q_idx * params.stride_lse_s_q + head_base + g + 8] = lse_val;
+        write_partial(g,     row_max_g,  row_sum_g,  o0, o1);
+        write_partial(g + 8, row_max_g8, row_sum_g8, o2, o3);
 
-        cutlass::bfloat16_t *out_row =
-            params.out + static_cast<size_t>(batch_idx) * params.stride_o_b +
-            s_q_idx * params.stride_o_s_q + (head_base + g + 8) * params.stride_o_h_q;
+    } else {
+        // Single-CTA mode: full normalize + sink + writeback (unchanged)
+        bool has_sink = params.attn_sink != nullptr;
 
-        #pragma unroll
-        for (int i = 0; i < V_TILES_PER_WARP; ++i) {
-            int v_base = (warp_id + i * NUM_WARPS) * MMA_N;
-            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t]     =
-                __float2bfloat16_rn(o2[i] * norm_factor);
-            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t + 1] =
-                __float2bfloat16_rn(o3[i] * norm_factor);
-        }
+        auto write_final = [&](int h, float rmax, float rsum,
+                               float *oa, float *ob) {
+            if (h >= heads_this_cta) return;
+            float sink_val = has_sink ? params.attn_sink[head_base + h] : 0.0f;
+            float lse_val, norm_factor;
+
+            if (rsum == 0.0f) {
+                lse_val = has_sink ? sink_val : -INFINITY;
+                norm_factor = 0.0f;
+            } else {
+                float log_sum = logf(rsum) + rmax;
+                if (has_sink) {
+                    float ss = 1.0f / (1.0f + __expf(sink_val - log_sum));
+                    norm_factor = ss / rsum;
+                    float m = fmaxf(log_sum, sink_val);
+                    lse_val = m + logf(__expf(log_sum - m) + __expf(sink_val - m));
+                } else {
+                    norm_factor = 1.0f / rsum;
+                    lse_val = log_sum;
+                }
+            }
+
+            if (lane_id == 0)
+                params.lse[static_cast<size_t>(batch_idx) * params.stride_lse_b +
+                           s_q_idx * params.stride_lse_s_q + head_base + h] = lse_val;
+
+            cutlass::bfloat16_t *out_row =
+                params.out + static_cast<size_t>(batch_idx) * params.stride_o_b +
+                s_q_idx * params.stride_o_s_q + (head_base + h) * params.stride_o_h_q;
+
+            #pragma unroll
+            for (int i = 0; i < V_TILES_PER_WARP; ++i) {
+                int v_base = (warp_id + i * NUM_WARPS) * MMA_N;
+                reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t]     =
+                    __float2bfloat16_rn(oa[i] * norm_factor);
+                reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t + 1] =
+                    __float2bfloat16_rn(ob[i] * norm_factor);
+            }
+        };
+
+        write_final(g,     row_max_g,  row_sum_g,  o0, o1);
+        write_final(g + 8, row_max_g8, row_sum_g8, o2, o3);
     }
 }
 
