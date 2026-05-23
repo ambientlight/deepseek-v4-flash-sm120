@@ -49,8 +49,11 @@ static constexpr int MMA_K = 16;
 static constexpr int V_TILES_PER_WARP = HEAD_DIM_V / (NUM_WARPS * MMA_N);  // 16
 
 __device__ __forceinline__ float ue8m0_to_scale(unsigned char b) {
-    int e = static_cast<int>(b) - 127;
-    return __powf(2.0f, static_cast<float>(e));
+    // UE8M0: value = 2^(b - 127). Bitcast b into FP32 exponent field.
+    // b=1..254: __uint_as_float(b << 23) = 2^(b-127) exactly.
+    // b=0: should be 2^-127 (FP32 subnormal), bitcast gives 0.0 — use fallback.
+    // b=255: UE8M0 NaN — should not appear in DeepSeek KV scales.
+    return __uint_as_float(static_cast<unsigned int>(b) << 23);
 }
 
 __device__ __forceinline__ void fp8x4_to_bf16x4(uint32_t bits, float scale,
