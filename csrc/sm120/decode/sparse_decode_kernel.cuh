@@ -25,7 +25,7 @@ namespace dsv4_kernel {
 namespace sm120 {
 
 static constexpr int BLOCK_M_HEADS = 16;
-static constexpr int KV_CHUNK      = 32;
+static constexpr int KV_CHUNK      = 64;
 static constexpr int HEAD_DIM_NOPE = 448;
 static constexpr int HEAD_DIM_ROPE = 64;
 static constexpr int HEAD_DIM_QK   = HEAD_DIM_NOPE + HEAD_DIM_ROPE;  // 512
@@ -38,7 +38,7 @@ static constexpr int NOPE_BYTES    = HEAD_DIM_NOPE;
 static constexpr int ROPE_BYTES    = HEAD_DIM_ROPE * 2;
 static constexpr int NOPE_ROPE_BYTES = NOPE_BYTES + ROPE_BYTES;
 
-static constexpr int NUM_WARPS     = 4;
+static constexpr int NUM_WARPS     = 8;
 static constexpr int NUM_THREADS   = NUM_WARPS * 32;
 
 static constexpr int MMA_M = 16;
@@ -349,7 +349,7 @@ __device__ __forceinline__ void hmma_pv_accum_reg(
 // When num_sm_parts == 1, behaves as before (full output).
 // -------------------------------------------------------------------
 template <int HEADS_PER_CTA = BLOCK_M_HEADS>
-__global__ __launch_bounds__(NUM_THREADS, 2)
+__global__ __launch_bounds__(NUM_THREADS, 1)
 void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
     extern __shared__ __align__(16) unsigned char _smem[];
     SmemLayout &smem = *reinterpret_cast<SmemLayout *>(_smem);
