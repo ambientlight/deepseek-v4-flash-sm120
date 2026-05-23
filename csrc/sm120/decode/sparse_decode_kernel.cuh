@@ -1,16 +1,14 @@
 // =====================================================================
-// SM_120 sparse decode kernel for DeepSeek-V4-Flash — HMMA production.
+// SM_120 sparse decode kernel — Register-resident O, targeting occ=2.
 //
-// All matmul paths (QK^T and P@V) use HMMA tensor core instructions
-// (mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32) on SM_120.
+// SMEM budget: sQ[16][512] + sK[32][512] + sP_union[16][32] = 50 KB
+// With 100 KB per SM on SM120, two CTAs fit → occupancy=2.
 //
-// No scalar dot-product loops in the production attention math path.
-// Scalar reductions (softmax max/sum/exp, normalization) remain SIMT.
+// sO[16][512] moved to per-thread FP32 register arrays (64 regs/thread).
+// Row stats (max, sum) also in registers.
+// sP and sP_bf16 share one union buffer.
 //
-// SMEM layout includes skew padding to reduce bank conflicts.
-//
-// Drop-in replacement for the original scalar kernel — same API,
-// same launch config, same on-disk KV format.
+// All matmul paths use HMMA tensor cores (m16n8k16 BF16).
 // =====================================================================
 #pragma once
 
@@ -36,22 +34,19 @@ static constexpr int HEAD_DIM_V    = HEAD_DIM_QK;                    // 512
 static constexpr int QUANT_TILE    = 64;
 static constexpr int NUM_ACTIVE_SCALES = HEAD_DIM_NOPE / QUANT_TILE;  // 7
 static constexpr int NUM_SCALE_SLOTS   = 8;
-static constexpr int NOPE_BYTES    = HEAD_DIM_NOPE;                  // 448
-static constexpr int ROPE_BYTES    = HEAD_DIM_ROPE * 2;              // 128
-static constexpr int NOPE_ROPE_BYTES = NOPE_BYTES + ROPE_BYTES;      // 576
-static constexpr int K_BYTES_PER_TOKEN =
-    NOPE_ROPE_BYTES + NUM_SCALE_SLOTS;                               // 584
+static constexpr int NOPE_BYTES    = HEAD_DIM_NOPE;
+static constexpr int ROPE_BYTES    = HEAD_DIM_ROPE * 2;
+static constexpr int NOPE_ROPE_BYTES = NOPE_BYTES + ROPE_BYTES;
 
 static constexpr int NUM_WARPS     = 4;
 static constexpr int NUM_THREADS   = NUM_WARPS * 32;
 
-// HMMA m16n8k16 tile dimensions
 static constexpr int MMA_M = 16;
 static constexpr int MMA_N = 8;
 static constexpr int MMA_K = 16;
 
-// SMEM skew to reduce bank conflicts on BF16 loads (8 bf16 = 16 bytes)
-static constexpr int SMEM_SKEW_BF16 = 8;
+// V tiles owned per warp for register-resident O
+static constexpr int V_TILES_PER_WARP = HEAD_DIM_V / (NUM_WARPS * MMA_N);  // 16
 
 __device__ __forceinline__ float ue8m0_to_scale(unsigned char b) {
     int e = static_cast<int>(b) - 127;
@@ -77,30 +72,28 @@ __device__ __forceinline__ unsigned int pack_bf16x2(
 }
 
 // -------------------------------------------------------------------
-// SMEM layout with skew padding and BF16 probability tile for P@V HMMA.
+// SMEM layout — minimal, targeting ≤50 KB for occupancy=2
 //
-// Budget (per CTA):
-//   sQ       : 16 × (512+8) × 2 =  16 640 B
-//   sK       : 32 × (512+8) × 2 =  33 280 B
-//   sP       : 16 × 32 × 4      =   2 048 B
-//   sP_bf16  : 16 × (32+8) × 2  =   1 280 B
-//   sO       : 16 × 512 × 4     =  32 768 B
-//   stats    :                        128 B
-//   ────────────────────────────────────────
-//   total                        ≈  86 KB (SM120: 101 KB limit)
+//   sQ[16][512] BF16     = 16,384 B  (16 KB)
+//   sK[32][512] BF16     = 32,768 B  (32 KB)
+//   sSP union(f32,bf16)  =  2,048 B  ( 2 KB)  [max of f32[16][32], bf16[16][32]]
+//   ──────────────────────────────────────────
+//   total                = 51,200 B  (50 KB exactly)
 // -------------------------------------------------------------------
-struct SmemLayout {
-    __nv_bfloat16 sQ[BLOCK_M_HEADS][HEAD_DIM_QK + SMEM_SKEW_BF16];
-    __nv_bfloat16 sK[KV_CHUNK][HEAD_DIM_QK + SMEM_SKEW_BF16];
-    float         sP[BLOCK_M_HEADS][KV_CHUNK];
-    __nv_bfloat16 sP_bf16[BLOCK_M_HEADS][KV_CHUNK + SMEM_SKEW_BF16];
-    float         sO[BLOCK_M_HEADS][HEAD_DIM_V];
-    float         sRowMax[BLOCK_M_HEADS];
-    float         sRowSum[BLOCK_M_HEADS];
+union ScoreProbUnion {
+    float         score[BLOCK_M_HEADS][KV_CHUNK];       // 2048 B
+    __nv_bfloat16 prob[BLOCK_M_HEADS][KV_CHUNK];        // 1024 B (fits in same space)
 };
 
+struct SmemLayout {
+    __nv_bfloat16 sQ[BLOCK_M_HEADS][HEAD_DIM_QK];       // 16,384 B
+    __nv_bfloat16 sK[KV_CHUNK][HEAD_DIM_QK];             // 32,768 B
+    ScoreProbUnion sSP;                                   //  2,048 B
+};
+// static_assert(sizeof(SmemLayout) <= 51200, "SMEM exceeds 50 KB target");
+
 // -------------------------------------------------------------------
-// Dequantise & load one KV chunk into sK (with skew stride).
+// Load KV chunk — dequant FP8→BF16 into sK (no skew, tight layout)
 // -------------------------------------------------------------------
 __device__ __forceinline__ void load_kv_chunk(
     SmemLayout &smem,
@@ -113,18 +106,16 @@ __device__ __forceinline__ void load_kv_chunk(
     int valid_tokens,
     int warp_id, int lane_id) {
 
-    constexpr int SK_STRIDE = HEAD_DIM_QK + SMEM_SKEW_BF16;
-
-    for (int t = warp_id; t < KV_CHUNK; t += NUM_WARPS) {
-        if (t >= valid_tokens) {
+    for (int tok = warp_id; tok < KV_CHUNK; tok += NUM_WARPS) {
+        if (tok >= valid_tokens) {
             for (int v = lane_id; v < HEAD_DIM_QK; v += 32)
-                smem.sK[t][v] = __float2bfloat16_rn(0.0f);
+                smem.sK[tok][v] = __float2bfloat16_rn(0.0f);
             continue;
         }
-        int flat_idx = indices_base[token_offset + t];
+        int flat_idx = indices_base[token_offset + tok];
         if (flat_idx < 0) {
             for (int v = lane_id; v < HEAD_DIM_QK; v += 32)
-                smem.sK[t][v] = __float2bfloat16_rn(0.0f);
+                smem.sK[tok][v] = __float2bfloat16_rn(0.0f);
             continue;
         }
         int block_idx    = flat_idx / page_block_size;
@@ -159,28 +150,21 @@ __device__ __forceinline__ void load_kv_chunk(
             for (int k = 0; k < 4; ++k) {
                 int dst = elem_start + k;
                 if (dst < HEAD_DIM_NOPE)
-                    smem.sK[t][dst] = out[k];
+                    smem.sK[tok][dst] = out[k];
             }
         }
 
         const __nv_bfloat16 *rope =
             reinterpret_cast<const __nv_bfloat16 *>(tok_nope_rope + NOPE_BYTES);
         if (lane_id * 2 + 1 < HEAD_DIM_ROPE) {
-            smem.sK[t][HEAD_DIM_NOPE + lane_id * 2 + 0] = rope[lane_id * 2 + 0];
-            smem.sK[t][HEAD_DIM_NOPE + lane_id * 2 + 1] = rope[lane_id * 2 + 1];
+            smem.sK[tok][HEAD_DIM_NOPE + lane_id * 2 + 0] = rope[lane_id * 2 + 0];
+            smem.sK[tok][HEAD_DIM_NOPE + lane_id * 2 + 1] = rope[lane_id * 2 + 1];
         }
     }
 }
 
 // -------------------------------------------------------------------
-// HMMA QK^T: sP[16][32] = sQ[16][512] × sK[32][512]^T
-//
-// Fragment mapping (g = lane>>2, t = lane&3):
-//   A: a0={sQ[g][K0+2t:+2]}, a1={sQ[g+8][K0+2t:+2]},
-//      a2={sQ[g][K0+2t+8:+2]}, a3={sQ[g+8][K0+2t+8:+2]}
-//   B: b0={sK[n_base+g][K0+2t:+2]}, b1={sK[n_base+g][K0+2t+8:+2]}
-//   D: d0=P[g][n_base+2t], d1=P[g][n_base+2t+1],
-//      d2=P[g+8][n_base+2t], d3=P[g+8][n_base+2t+1]
+// HMMA QK^T → sSP.score[16][32]
 // -------------------------------------------------------------------
 __device__ __forceinline__ void hmma_qk_dot(
     SmemLayout &smem,
@@ -227,119 +211,112 @@ __device__ __forceinline__ void hmma_qk_dot(
     int p_col0 = n_base + 2*t;
     int p_col1 = p_col0 + 1;
     if (g < heads_this_cta) {
-        smem.sP[g][p_col0] = (p_col0 < valid) ? d0 * sm_scale : -INFINITY;
-        smem.sP[g][p_col1] = (p_col1 < valid) ? d1 * sm_scale : -INFINITY;
+        smem.sSP.score[g][p_col0] = (p_col0 < valid) ? d0 * sm_scale : -INFINITY;
+        smem.sSP.score[g][p_col1] = (p_col1 < valid) ? d1 * sm_scale : -INFINITY;
     }
     if (g + 8 < heads_this_cta) {
-        smem.sP[g + 8][p_col0] = (p_col0 < valid) ? d2 * sm_scale : -INFINITY;
-        smem.sP[g + 8][p_col1] = (p_col1 < valid) ? d3 * sm_scale : -INFINITY;
+        smem.sSP.score[g + 8][p_col0] = (p_col0 < valid) ? d2 * sm_scale : -INFINITY;
+        smem.sSP.score[g + 8][p_col1] = (p_col1 < valid) ? d3 * sm_scale : -INFINITY;
     }
 }
 
 // -------------------------------------------------------------------
-// Online softmax: compute exps, update running max/sum, rescale sO,
-// and store BF16 probabilities in sP_bf16 for HMMA P@V.
+// Online softmax + convert score→prob in-place union + rescale reg O.
+//
+// Reads sSP.score[], writes sSP.prob[] in-place.
+// Safe because BF16 prob[h][k] occupies first half of FP32 score[h][k]
+// — processing k=0..31 sequentially, each FP32 read happens before
+// the BF16 write to the same (or earlier) memory.
 // -------------------------------------------------------------------
-__device__ __forceinline__ void softmax_prepare_p_bf16_and_rescale_o(
+__device__ __forceinline__ void softmax_and_rescale_reg_o(
     SmemLayout &smem,
     int heads_this_cta,
-    int warp_id, int lane_id) {
+    int warp_id, int lane_id,
+    float *o0, float *o1, float *o2, float *o3,
+    float &row_max_g, float &row_sum_g,
+    float &row_max_g8, float &row_sum_g8) {
 
-    for (int h = warp_id; h < heads_this_cta; h += NUM_WARPS) {
+    int g = lane_id >> 2;
+
+    // Helper: process one head row — rescale O accumulators and convert score→prob
+    auto process_head = [&](int h, float &rmax, float &rsum,
+                            float *oa, float *ob) {
+        if (h >= heads_this_cta) return;
+
         float chunk_max = -INFINITY;
         #pragma unroll
         for (int k = 0; k < KV_CHUNK; ++k)
-            chunk_max = fmaxf(chunk_max, smem.sP[h][k]);
+            chunk_max = fmaxf(chunk_max, smem.sSP.score[h][k]);
 
-        float old_max = smem.sRowMax[h];
+        float old_max = rmax;
         float new_max = fmaxf(old_max, chunk_max);
         float rescale = (old_max == -INFINITY) ? 0.0f : __expf(old_max - new_max);
 
-        if (lane_id == 0) {
-            smem.sRowMax[h] = new_max;
-            smem.sRowSum[h] *= rescale;
-        }
-        for (int v = lane_id; v < HEAD_DIM_V; v += 32)
-            smem.sO[h][v] *= rescale;
+        rmax = new_max;
+        rsum *= rescale;
 
+        // Rescale BOTH O accumulator arrays for this head row
+        #pragma unroll
+        for (int i = 0; i < V_TILES_PER_WARP; ++i) {
+            oa[i] *= rescale;
+            ob[i] *= rescale;
+        }
+
+        // Compute exps and convert score→prob in-place
         float local_sum = 0.0f;
         #pragma unroll
         for (int k = 0; k < KV_CHUNK; ++k) {
-            float p = smem.sP[h][k];
+            float p = smem.sSP.score[h][k];
             float e = (p == -INFINITY) ? 0.0f : __expf(p - new_max);
             local_sum += e;
-            smem.sP_bf16[h][k] = __float2bfloat16_rn(e);
+            smem.sSP.prob[h][k] = __float2bfloat16_rn(e);
         }
-        // Zero skew padding
-        #pragma unroll
-        for (int k = KV_CHUNK; k < KV_CHUNK + SMEM_SKEW_BF16; ++k)
-            smem.sP_bf16[h][k] = __float2bfloat16_rn(0.0f);
+        rsum += local_sum;
+    };
 
-        if (lane_id == 0)
-            smem.sRowSum[h] += local_sum;
-    }
-    // Zero inactive head rows in sP_bf16
-    for (int h = heads_this_cta + warp_id; h < BLOCK_M_HEADS; h += NUM_WARPS) {
-        for (int k = lane_id; k < KV_CHUNK + SMEM_SKEW_BF16; k += 32)
-            smem.sP_bf16[h][k] = __float2bfloat16_rn(0.0f);
-    }
+    // Row g owns o0, o1. Row g+8 owns o2, o3.
+    process_head(g,     row_max_g,  row_sum_g,  o0, o1);
+    process_head(g + 8, row_max_g8, row_sum_g8, o2, o3);
 }
 
 // -------------------------------------------------------------------
-// HMMA P@V: sO[16][512] += sP_bf16[16][32] × sK[32][512]
+// HMMA P@V: accumulate into register-resident O arrays.
 //
-// P is A (row-major, M=16, K=32), V is B (logical col-major K×N).
-// V storage is sK[token][v] row-major, so B_col[k][n] = sK[k][n].
-//
-// For B: b0 = pack(sK[k_base+2t][v_base+g], sK[k_base+2t+1][v_base+g])
-//        b1 = pack(sK[k_base+2t+8][v_base+g], sK[k_base+2t+9][v_base+g])
-// Note: strided loads (non-contiguous) — two elements from different rows.
-//
-// Each warp iterates over v_base in steps of NUM_WARPS*8.
-// KV_CHUNK=32 → 2 HMMA K-steps of 16 per v-tile.
+// Each warp owns V_TILES_PER_WARP=16 value tiles.
+// Warp w owns v_base = (w + i*NUM_WARPS) * 8 for i=0..15.
+// Register o0[i]..o3[i] maps to O[g/g+8][v_base + 2t/2t+1].
 // -------------------------------------------------------------------
-__device__ __forceinline__ void hmma_pv_accum(
+__device__ __forceinline__ void hmma_pv_accum_reg(
     SmemLayout &smem,
     int heads_this_cta,
-    int warp_id, int lane_id) {
+    int warp_id, int lane_id,
+    float *o0, float *o1, float *o2, float *o3) {
 
     int g = lane_id >> 2;
     int t = lane_id & 3;
     unsigned int zero = 0;
 
-    for (int v_base = warp_id * MMA_N;
-         v_base < HEAD_DIM_V;
-         v_base += NUM_WARPS * MMA_N) {
+    #pragma unroll
+    for (int i = 0; i < V_TILES_PER_WARP; ++i) {
+        int v_base = (warp_id + i * NUM_WARPS) * MMA_N;
 
-        // Load existing sO accumulators into HMMA registers
-        float d0 = (g < heads_this_cta)
-            ? smem.sO[g][v_base + 2*t] : 0.0f;
-        float d1 = (g < heads_this_cta)
-            ? smem.sO[g][v_base + 2*t + 1] : 0.0f;
-        float d2 = (g + 8 < heads_this_cta)
-            ? smem.sO[g + 8][v_base + 2*t] : 0.0f;
-        float d3 = (g + 8 < heads_this_cta)
-            ? smem.sO[g + 8][v_base + 2*t + 1] : 0.0f;
+        float d0 = o0[i], d1 = o1[i], d2 = o2[i], d3 = o3[i];
 
-        // Iterate over K=32 in two steps of 16
         #pragma unroll
         for (int k_base = 0; k_base < KV_CHUNK; k_base += MMA_K) {
-            // A fragment from sP_bf16[16][32+skew]
             unsigned int a0 = (g < heads_this_cta)
-                ? *reinterpret_cast<const unsigned int*>(&smem.sP_bf16[g][k_base + 2*t])
+                ? *reinterpret_cast<const unsigned int*>(&smem.sSP.prob[g][k_base + 2*t])
                 : zero;
             unsigned int a1 = (g + 8 < heads_this_cta)
-                ? *reinterpret_cast<const unsigned int*>(&smem.sP_bf16[g + 8][k_base + 2*t])
+                ? *reinterpret_cast<const unsigned int*>(&smem.sSP.prob[g + 8][k_base + 2*t])
                 : zero;
             unsigned int a2 = (g < heads_this_cta)
-                ? *reinterpret_cast<const unsigned int*>(&smem.sP_bf16[g][k_base + 2*t + 8])
+                ? *reinterpret_cast<const unsigned int*>(&smem.sSP.prob[g][k_base + 2*t + 8])
                 : zero;
             unsigned int a3 = (g + 8 < heads_this_cta)
-                ? *reinterpret_cast<const unsigned int*>(&smem.sP_bf16[g + 8][k_base + 2*t + 8])
+                ? *reinterpret_cast<const unsigned int*>(&smem.sSP.prob[g + 8][k_base + 2*t + 8])
                 : zero;
 
-            // B fragment from V = sK[token][v] — strided loads
-            // B_col[k][n] = sK[k][v_base + n], n = g for this lane
             unsigned int b0 = pack_bf16x2(
                 smem.sK[k_base + 2*t    ][v_base + g],
                 smem.sK[k_base + 2*t + 1][v_base + g]);
@@ -355,20 +332,12 @@ __device__ __forceinline__ void hmma_pv_accum(
             );
         }
 
-        // Write back accumulated sO
-        if (g < heads_this_cta) {
-            smem.sO[g][v_base + 2*t]     = d0;
-            smem.sO[g][v_base + 2*t + 1] = d1;
-        }
-        if (g + 8 < heads_this_cta) {
-            smem.sO[g + 8][v_base + 2*t]     = d2;
-            smem.sO[g + 8][v_base + 2*t + 1] = d3;
-        }
+        o0[i] = d0; o1[i] = d1; o2[i] = d2; o3[i] = d3;
     }
 }
 
 // -------------------------------------------------------------------
-// Main kernel — all matmul paths use HMMA tensor cores.
+// Main kernel — register-resident O, targeting occupancy=2.
 // -------------------------------------------------------------------
 template <int HEADS_PER_CTA = BLOCK_M_HEADS>
 __global__ __launch_bounds__(NUM_THREADS, 2)
@@ -387,6 +356,8 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
     const int tid     = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
+    const int g = lane_id >> 2;
+    const int t = lane_id & 3;
 
     int my_topk = params.topk;
     if (params.topk_length)
@@ -401,25 +372,30 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
         if (my_extra_topk < 0) my_extra_topk = 0;
     }
 
-    // ---- Load Q (with skew stride) ----
+    // ---- Register-resident O accumulators ----
+    float o0[V_TILES_PER_WARP], o1[V_TILES_PER_WARP];
+    float o2[V_TILES_PER_WARP], o3[V_TILES_PER_WARP];
+    #pragma unroll
+    for (int i = 0; i < V_TILES_PER_WARP; ++i) {
+        o0[i] = 0.0f; o1[i] = 0.0f; o2[i] = 0.0f; o3[i] = 0.0f;
+    }
+
+    // Register-resident row stats
+    float row_max_g  = -INFINITY, row_sum_g  = 0.0f;
+    float row_max_g8 = -INFINITY, row_sum_g8 = 0.0f;
+
+    // ---- Load Q ----
     const cutlass::bfloat16_t *q_base =
         params.q + static_cast<size_t>(batch_idx) * params.stride_q_b +
         s_q_idx * params.stride_q_s_q + head_base * params.stride_q_h_q;
     for (int h = 0; h < heads_this_cta; ++h) {
         const cutlass::bfloat16_t *row = q_base + h * params.stride_q_h_q;
-        for (int t = tid; t < HEAD_DIM_QK; t += NUM_THREADS)
-            smem.sQ[h][t] = reinterpret_cast<const __nv_bfloat16 *>(row)[t];
+        for (int d = tid; d < HEAD_DIM_QK; d += NUM_THREADS)
+            smem.sQ[h][d] = reinterpret_cast<const __nv_bfloat16 *>(row)[d];
     }
-    // Zero inactive head Q rows
-    for (int h = heads_this_cta; h < BLOCK_M_HEADS; ++h) {
-        for (int t = tid; t < HEAD_DIM_QK; t += NUM_THREADS)
-            smem.sQ[h][t] = __float2bfloat16_rn(0.0f);
-    }
-    if (tid < BLOCK_M_HEADS) {
-        smem.sRowMax[tid] = -INFINITY;
-        smem.sRowSum[tid] = 0.0f;
-        for (int v = 0; v < HEAD_DIM_V; ++v) smem.sO[tid][v] = 0.0f;
-    }
+    for (int h = heads_this_cta; h < BLOCK_M_HEADS; ++h)
+        for (int d = tid; d < HEAD_DIM_QK; d += NUM_THREADS)
+            smem.sQ[h][d] = __float2bfloat16_rn(0.0f);
     __syncthreads();
 
     const int *indices_base =
@@ -445,78 +421,114 @@ void dsv4_sparse_decode_kernel(SparseAttnDecodeParams params) {
                           warp_id, lane_id);
             __syncthreads();
 
-            // QK^T — HMMA
             hmma_qk_dot(smem, heads_this_cta, valid, params.sm_scale,
                         warp_id, lane_id);
             __syncthreads();
 
-            // Softmax + prepare BF16 probabilities + rescale sO
-            softmax_prepare_p_bf16_and_rescale_o(
-                smem, heads_this_cta, warp_id, lane_id);
+            softmax_and_rescale_reg_o(smem, heads_this_cta, warp_id, lane_id,
+                                     o0, o1, o2, o3,
+                                     row_max_g, row_sum_g,
+                                     row_max_g8, row_sum_g8);
             __syncthreads();
 
-            // P@V — HMMA
-            hmma_pv_accum(smem, heads_this_cta, warp_id, lane_id);
+            hmma_pv_accum_reg(smem, heads_this_cta, warp_id, lane_id,
+                              o0, o1, o2, o3);
             __syncthreads();
         }
     };
 
-    // Main KV loop.
     process(reinterpret_cast<const uint8_t *>(params.kv),
             params.stride_kv_block, params.stride_kv_row,
             params.page_block_size, indices_base, my_topk);
-    // Optional SWA sidecar.
-    if (params.extra_kv) {
+    if (params.extra_kv)
         process(reinterpret_cast<const uint8_t *>(params.extra_kv),
                 params.stride_extra_kv_block, params.stride_extra_kv_row,
                 params.extra_page_block_size, extra_indices_base,
                 my_extra_topk);
-    }
 
-    // --- Epilogue: normalise, apply attn_sink, writeback ---
-    for (int h_local = warp_id; h_local < heads_this_cta; h_local += NUM_WARPS) {
-        float row_max = smem.sRowMax[h_local];
-        float row_sum = smem.sRowSum[h_local];
-        bool  has_sink = params.attn_sink != nullptr;
-        float sink    = has_sink ? params.attn_sink[head_base + h_local] : 0.0f;
+    // --- Epilogue: normalize + sink + writeback from registers ---
+    bool has_sink = params.attn_sink != nullptr;
 
+    // Row g
+    if (g < heads_this_cta) {
+        float rmax = row_max_g, rsum = row_sum_g;
+        float sink_val = has_sink ? params.attn_sink[head_base + g] : 0.0f;
         float lse_val;
-        if (row_sum == 0.0f) {
-            lse_val = has_sink ? sink : -INFINITY;
-            for (int v = lane_id; v < HEAD_DIM_V; v += 32)
-                smem.sO[h_local][v] = 0.0f;
+        float norm_factor;
+
+        if (rsum == 0.0f) {
+            lse_val = has_sink ? sink_val : -INFINITY;
+            norm_factor = 0.0f;
         } else {
-            float log_sum = logf(row_sum) + row_max;
+            float log_sum = logf(rsum) + rmax;
             if (has_sink) {
-                float sink_scale = 1.0f / (1.0f + __expf(sink - log_sum));
-                for (int v = lane_id; v < HEAD_DIM_V; v += 32)
-                    smem.sO[h_local][v] =
-                        (smem.sO[h_local][v] / row_sum) * sink_scale;
-                float m = fmaxf(log_sum, sink);
-                lse_val = m + logf(__expf(log_sum - m) + __expf(sink - m));
+                float ss = 1.0f / (1.0f + __expf(sink_val - log_sum));
+                norm_factor = ss / rsum;
+                float m = fmaxf(log_sum, sink_val);
+                lse_val = m + logf(__expf(log_sum - m) + __expf(sink_val - m));
             } else {
-                for (int v = lane_id; v < HEAD_DIM_V; v += 32)
-                    smem.sO[h_local][v] = smem.sO[h_local][v] / row_sum;
+                norm_factor = 1.0f / rsum;
                 lse_val = log_sum;
             }
         }
-        if (lane_id == 0) {
+
+        if (lane_id == 0)
             params.lse[static_cast<size_t>(batch_idx) * params.stride_lse_b +
-                       s_q_idx * params.stride_lse_s_q + head_base + h_local] =
-                lse_val;
+                       s_q_idx * params.stride_lse_s_q + head_base + g] = lse_val;
+
+        cutlass::bfloat16_t *out_row =
+            params.out + static_cast<size_t>(batch_idx) * params.stride_o_b +
+            s_q_idx * params.stride_o_s_q + (head_base + g) * params.stride_o_h_q;
+
+        #pragma unroll
+        for (int i = 0; i < V_TILES_PER_WARP; ++i) {
+            int v_base = (warp_id + i * NUM_WARPS) * MMA_N;
+            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t]     =
+                __float2bfloat16_rn(o0[i] * norm_factor);
+            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t + 1] =
+                __float2bfloat16_rn(o1[i] * norm_factor);
         }
     }
-    __syncthreads();
 
-    // Write out BF16 output [b, s_q, h_q, 512].
-    cutlass::bfloat16_t *out_base =
-        params.out + static_cast<size_t>(batch_idx) * params.stride_o_b +
-        s_q_idx * params.stride_o_s_q + head_base * params.stride_o_h_q;
-    for (int h_local = 0; h_local < heads_this_cta; ++h_local) {
-        cutlass::bfloat16_t *row_out = out_base + h_local * params.stride_o_h_q;
-        for (int v = tid; v < HEAD_DIM_V; v += NUM_THREADS)
-            reinterpret_cast<__nv_bfloat16 *>(row_out)[v] =
-                __float2bfloat16_rn(smem.sO[h_local][v]);
+    // Row g+8
+    if (g + 8 < heads_this_cta) {
+        float rmax = row_max_g8, rsum = row_sum_g8;
+        float sink_val = has_sink ? params.attn_sink[head_base + g + 8] : 0.0f;
+        float lse_val;
+        float norm_factor;
+
+        if (rsum == 0.0f) {
+            lse_val = has_sink ? sink_val : -INFINITY;
+            norm_factor = 0.0f;
+        } else {
+            float log_sum = logf(rsum) + rmax;
+            if (has_sink) {
+                float ss = 1.0f / (1.0f + __expf(sink_val - log_sum));
+                norm_factor = ss / rsum;
+                float m = fmaxf(log_sum, sink_val);
+                lse_val = m + logf(__expf(log_sum - m) + __expf(sink_val - m));
+            } else {
+                norm_factor = 1.0f / rsum;
+                lse_val = log_sum;
+            }
+        }
+
+        if (lane_id == 0)
+            params.lse[static_cast<size_t>(batch_idx) * params.stride_lse_b +
+                       s_q_idx * params.stride_lse_s_q + head_base + g + 8] = lse_val;
+
+        cutlass::bfloat16_t *out_row =
+            params.out + static_cast<size_t>(batch_idx) * params.stride_o_b +
+            s_q_idx * params.stride_o_s_q + (head_base + g + 8) * params.stride_o_h_q;
+
+        #pragma unroll
+        for (int i = 0; i < V_TILES_PER_WARP; ++i) {
+            int v_base = (warp_id + i * NUM_WARPS) * MMA_N;
+            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t]     =
+                __float2bfloat16_rn(o2[i] * norm_factor);
+            reinterpret_cast<__nv_bfloat16 *>(out_row)[v_base + 2*t + 1] =
+                __float2bfloat16_rn(o3[i] * norm_factor);
+        }
     }
 }
 
