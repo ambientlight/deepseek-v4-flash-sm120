@@ -17,6 +17,99 @@ This repo builds a small SM120 CUDA extension and injects it at runtime with:
 
 No SGLang image rebuild and no install inside the container are required.
 
+## SM120 HMMA Tensor Core Optimization (feat/hmma-tensor-core-sparse-decode)
+
+The `feat/hmma-tensor-core-sparse-decode` branch replaces the original scalar CUDA-core sparse decode kernel with an HMMA tensor core implementation, achieving **2.2–2.5× speedup** on both TTFT and decode throughput.
+
+### Latest: HMMA vs upstream Triton sparse decode (2026-06-08)
+
+SGLang has since merged an **in-tree Triton SM120 sparse-decode kernel** (`flash_mla_sm120_triton.py`, PR #24692) as the first-class SM120 path. Measured end-to-end against our HMMA `.so`, on the **same** server config — DeepSeek-V4-Flash, 4× RTX PRO 6000, TP=4, native MXFP4 fused-MoE experts (FlashInfer CuTe-DSL `MmaMXF4Op`), CUDA graphs on — swapping **only** the sparse-decode kernel:
+
+| Concurrency | Triton sparse decode | **HMMA sparse decode** | HMMA speedup |
+|---:|---:|---:|---:|
+| 1  | 13 tok/s | **80 tok/s**  | 6.2× |
+| 4  | 37 tok/s | **265 tok/s** | 7.2× |
+| 8  | 49 tok/s | **479 tok/s** | 9.8× |
+| 16 | 54 tok/s | **757 tok/s** | **14×** |
+
+Decode throughput (256-token output, `ignore_eos`, greedy). Triton plateaus near ~54 tok/s and does **not** scale with concurrency; HMMA scales to 757 tok/s at 16-wide. Both produce correct output; the only variable is the attention sparse-decode kernel. The kernel is selected at runtime via `SGLANG_SM120_SPARSE_DECODE=hmma|triton` (default `hmma`).
+
+> This kernel is a drop-in for FlashMLA's `sparse_decode_fwd` and is orthogonal to the MoE path: it pairs with either the native MXFP4 fused MoE or any other expert backend. The MoE experts above run the native MXFP4×MXFP4 FlashInfer kernels; the decode numbers isolate the attention kernel only.
+
+### What changed
+
+| Optimization | Impact |
+|---|---|
+| HMMA QK^T (`mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`) | Replaced scalar BF16 dot-products with tensor core matmul for attention scores |
+| HMMA P@V | Same tensor core path for probability × value accumulation |
+| Register-resident FP32 O accumulator | Moved output from 32 KB SMEM to 32 registers/thread — eliminates SMEM traffic |
+| Split-KV adaptive parallelism | Spreads one CTA's work across up to 128 CTAs for better SM utilization during decode |
+| KV_CHUNK=64 / 8 warps | Halves chunk iterations and barriers; natural 8 QK^T N-tiles |
+| UE8M0 bitcast dequant | `__uint_as_float(b << 23)` replaces `__powf` for FP8 scale conversion |
+
+### Direct comparison vs upstream scalar kernel (same hardware, same prompts)
+
+| Context | Upstream Scalar Decode | HMMA Optimized Decode | Decode Speedup |
+|---:|---:|---:|---:|
+| 8K | 37.59 tok/s | **47.29 tok/s** | **1.26×** |
+| 16K | 37.99 tok/s | **44.23 tok/s** | **1.16×** |
+| 32K | 35.50 tok/s | **40.48 tok/s** | **1.14×** |
+| 64K | 30.33 tok/s | **34.24 tok/s** | **1.13×** |
+
+> Note: Upstream used EAGLE speculative decoding (broken on SM120 — produces garbled output). Our decode speedup is from HMMA tensor cores + split-KV + register-sO + KV64/8w, without speculative decoding.
+
+### TTFT (prefill latency):
+
+| Context | Original scalar | HMMA optimized | Speedup |
+|---:|---:|---:|---:|
+| 8K | 4.1s | **1.9s** | **2.2×** |
+| 16K | 8.3s | **3.8s** | **2.2×** |
+| 32K | 18.2s | **8.3s** | **2.2×** |
+| 64K | 39.1s | **15.6s** | **2.5×** |
+
+**Decode throughput (single stream):**
+
+| Context | Original scalar | HMMA optimized | Speedup |
+|---:|---:|---:|---:|
+| 256 | 35.3 tok/s | **57.6 tok/s** | **1.6×** |
+| 4K | 21.3 tok/s | **48.1 tok/s** | **2.3×** |
+| 16K | 20.8 tok/s | **45.4 tok/s** | **2.2×** |
+| 32K | 18.0 tok/s | **39.9 tok/s** | **2.2×** |
+| 64K | 14.5 tok/s | **33.9 tok/s** | **2.3×** |
+
+**Decode ITL (steady-state inter-token latency, 128 output tokens):**
+
+| Context | Median ITL | Steady tok/s |
+|---:|---:|---:|
+| 256 | 16.4ms | 57.2 |
+| 1K | 17.8ms | 52.3 |
+| 4K | 20.0ms | 47.2 |
+| 8K | 20.3ms | 46.2 |
+| 16K | 21.4ms | 44.0 |
+
+### SM120 hardware constraints discovered
+
+- 100 KB shared memory per SM (not 228 KB like datacenter Blackwell)
+- Block-scaled MMA (`.kind::mxf8f6f4`, `.block_scale`) — **not supported** on SM120
+- Scaled packed FP8→BF16 conversion (`cvt.rn.satfinite.scaled::n2::ue8m0`) — **not supported** on SM120
+- FP8 `mma.sync.aligned.m16n8k32` works but is slower than BF16 HMMA for this kernel due to per-tile scale overhead without block-scale MMA
+- `torch.compile` / piecewise CUDA graphs — crash on SM120
+- EAGLE speculative decoding — produces garbled output on SM120 (draft token verification bug)
+- 4 warp schedulers per SM; h_q=16 per TP shard → base_ctas=1 for single-request decode
+
+### NCCL tuning for PCIe Max-Q
+
+These environment variables are critical for RTX PRO 6000 workstations (PCIe, no NVLink):
+
+```bash
+NCCL_PROTO=LL
+NCCL_ALGO=Ring
+NCCL_MIN_NCHANNELS=8
+NCCL_NTHREADS=512
+```
+
+Also required: `--disable-custom-all-reduce` (prevents NCCL deadlock on PCIe Max-Q topology).
+
 ## Correct current launch recipe
 
 Important corrections:
@@ -115,99 +208,6 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 ## License
 
 Kernel, scripts, and docs are Apache-2.0. CUTLASS under `csrc/cutlass/` keeps its NVIDIA BSD-3 license. Model weights and SGLang image keep their upstream licenses.
-
-## SM120 HMMA Tensor Core Optimization (feat/hmma-tensor-core-sparse-decode)
-
-The `feat/hmma-tensor-core-sparse-decode` branch replaces the original scalar CUDA-core sparse decode kernel with an HMMA tensor core implementation, achieving **2.2–2.5× speedup** on both TTFT and decode throughput.
-
-### Latest: HMMA vs upstream Triton sparse decode (2026-06-08)
-
-SGLang has since merged an **in-tree Triton SM120 sparse-decode kernel** (`flash_mla_sm120_triton.py`, PR #24692) as the first-class SM120 path. Measured end-to-end against our HMMA `.so`, on the **same** server config — DeepSeek-V4-Flash, 4× RTX PRO 6000, TP=4, native MXFP4 fused-MoE experts (FlashInfer CuTe-DSL `MmaMXF4Op`), CUDA graphs on — swapping **only** the sparse-decode kernel:
-
-| Concurrency | Triton sparse decode | **HMMA sparse decode** | HMMA speedup |
-|---:|---:|---:|---:|
-| 1  | 13 tok/s | **80 tok/s**  | 6.2× |
-| 4  | 37 tok/s | **265 tok/s** | 7.2× |
-| 8  | 49 tok/s | **479 tok/s** | 9.8× |
-| 16 | 54 tok/s | **757 tok/s** | **14×** |
-
-Decode throughput (256-token output, `ignore_eos`, greedy). Triton plateaus near ~54 tok/s and does **not** scale with concurrency; HMMA scales to 757 tok/s at 16-wide. Both produce correct output; the only variable is the attention sparse-decode kernel. The kernel is selected at runtime via `SGLANG_SM120_SPARSE_DECODE=hmma|triton` (default `hmma`).
-
-> This kernel is a drop-in for FlashMLA's `sparse_decode_fwd` and is orthogonal to the MoE path: it pairs with either the native MXFP4 fused MoE or any other expert backend. The MoE experts above run the native MXFP4×MXFP4 FlashInfer kernels; the decode numbers isolate the attention kernel only.
-
-### What changed
-
-| Optimization | Impact |
-|---|---|
-| HMMA QK^T (`mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`) | Replaced scalar BF16 dot-products with tensor core matmul for attention scores |
-| HMMA P@V | Same tensor core path for probability × value accumulation |
-| Register-resident FP32 O accumulator | Moved output from 32 KB SMEM to 32 registers/thread — eliminates SMEM traffic |
-| Split-KV adaptive parallelism | Spreads one CTA's work across up to 128 CTAs for better SM utilization during decode |
-| KV_CHUNK=64 / 8 warps | Halves chunk iterations and barriers; natural 8 QK^T N-tiles |
-| UE8M0 bitcast dequant | `__uint_as_float(b << 23)` replaces `__powf` for FP8 scale conversion |
-
-### Direct comparison vs upstream scalar kernel (same hardware, same prompts)
-
-| Context | Upstream Scalar Decode | HMMA Optimized Decode | Decode Speedup |
-|---:|---:|---:|---:|
-| 8K | 37.59 tok/s | **47.29 tok/s** | **1.26×** |
-| 16K | 37.99 tok/s | **44.23 tok/s** | **1.16×** |
-| 32K | 35.50 tok/s | **40.48 tok/s** | **1.14×** |
-| 64K | 30.33 tok/s | **34.24 tok/s** | **1.13×** |
-
-> Note: Upstream used EAGLE speculative decoding (broken on SM120 — produces garbled output). Our decode speedup is from HMMA tensor cores + split-KV + register-sO + KV64/8w, without speculative decoding.
-
-### TTFT (prefill latency):
-
-| Context | Original scalar | HMMA optimized | Speedup |
-|---:|---:|---:|---:|
-| 8K | 4.1s | **1.9s** | **2.2×** |
-| 16K | 8.3s | **3.8s** | **2.2×** |
-| 32K | 18.2s | **8.3s** | **2.2×** |
-| 64K | 39.1s | **15.6s** | **2.5×** |
-
-**Decode throughput (single stream):**
-
-| Context | Original scalar | HMMA optimized | Speedup |
-|---:|---:|---:|---:|
-| 256 | 35.3 tok/s | **57.6 tok/s** | **1.6×** |
-| 4K | 21.3 tok/s | **48.1 tok/s** | **2.3×** |
-| 16K | 20.8 tok/s | **45.4 tok/s** | **2.2×** |
-| 32K | 18.0 tok/s | **39.9 tok/s** | **2.2×** |
-| 64K | 14.5 tok/s | **33.9 tok/s** | **2.3×** |
-
-**Decode ITL (steady-state inter-token latency, 128 output tokens):**
-
-| Context | Median ITL | Steady tok/s |
-|---:|---:|---:|
-| 256 | 16.4ms | 57.2 |
-| 1K | 17.8ms | 52.3 |
-| 4K | 20.0ms | 47.2 |
-| 8K | 20.3ms | 46.2 |
-| 16K | 21.4ms | 44.0 |
-
-### SM120 hardware constraints discovered
-
-- 100 KB shared memory per SM (not 228 KB like datacenter Blackwell)
-- Block-scaled MMA (`.kind::mxf8f6f4`, `.block_scale`) — **not supported** on SM120
-- Scaled packed FP8→BF16 conversion (`cvt.rn.satfinite.scaled::n2::ue8m0`) — **not supported** on SM120
-- FP8 `mma.sync.aligned.m16n8k32` works but is slower than BF16 HMMA for this kernel due to per-tile scale overhead without block-scale MMA
-- `torch.compile` / piecewise CUDA graphs — crash on SM120
-- EAGLE speculative decoding — produces garbled output on SM120 (draft token verification bug)
-- 4 warp schedulers per SM; h_q=16 per TP shard → base_ctas=1 for single-request decode
-
-### NCCL tuning for PCIe Max-Q
-
-These environment variables are critical for RTX PRO 6000 workstations (PCIe, no NVLink):
-
-```bash
-NCCL_PROTO=LL
-NCCL_ALGO=Ring
-NCCL_MIN_NCHANNELS=8
-NCCL_NTHREADS=512
-```
-
-Also required: `--disable-custom-all-reduce` (prevents NCCL deadlock on PCIe Max-Q topology).
 
 ## Original scalar kernel benchmark (upstream, pre-HMMA)
 
