@@ -120,6 +120,21 @@ Kernel, scripts, and docs are Apache-2.0. CUTLASS under `csrc/cutlass/` keeps it
 
 The `feat/hmma-tensor-core-sparse-decode` branch replaces the original scalar CUDA-core sparse decode kernel with an HMMA tensor core implementation, achieving **2.2–2.5× speedup** on both TTFT and decode throughput.
 
+### Latest: HMMA vs upstream Triton sparse decode (2026-06-08)
+
+SGLang has since merged an **in-tree Triton SM120 sparse-decode kernel** (`flash_mla_sm120_triton.py`, PR #24692) as the first-class SM120 path. Measured end-to-end against our HMMA `.so`, on the **same** server config — DeepSeek-V4-Flash, 4× RTX PRO 6000, TP=4, native MXFP4 fused-MoE experts (FlashInfer CuTe-DSL `MmaMXF4Op`), CUDA graphs on — swapping **only** the sparse-decode kernel:
+
+| Concurrency | Triton sparse decode | **HMMA sparse decode** | HMMA speedup |
+|---:|---:|---:|---:|
+| 1  | 13 tok/s | **80 tok/s**  | 6.2× |
+| 4  | 37 tok/s | **265 tok/s** | 7.2× |
+| 8  | 49 tok/s | **479 tok/s** | 9.8× |
+| 16 | 54 tok/s | **757 tok/s** | **14×** |
+
+Decode throughput (256-token output, `ignore_eos`, greedy). Triton plateaus near ~54 tok/s and does **not** scale with concurrency; HMMA scales to 757 tok/s at 16-wide. Both produce correct output; the only variable is the attention sparse-decode kernel. The kernel is selected at runtime via `SGLANG_SM120_SPARSE_DECODE=hmma|triton` (default `hmma`).
+
+> This kernel is a drop-in for FlashMLA's `sparse_decode_fwd` and is orthogonal to the MoE path: it pairs with either the native MXFP4 fused MoE or any other expert backend. The MoE experts above run the native MXFP4×MXFP4 FlashInfer kernels; the decode numbers isolate the attention kernel only.
+
 ### What changed
 
 | Optimization | Impact |

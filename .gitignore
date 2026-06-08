@@ -40,3 +40,11 @@ htmlcov/
 .env.*
 secrets/
 csrc/cutlass/
+
+# Compiled benchmark/test executables (host-built next to their .cu source).
+/csrc/bench_fused_moe_ncu
+/csrc/bench_gemv_v2
+/csrc/bench_gemv_v3
+/csrc/bench_moe
+/csrc/test_bf16_to_fp4
+/csrc/test_fp4_moe_gemm
