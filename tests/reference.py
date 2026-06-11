@@ -132,6 +132,108 @@ def sparse_decode_reference(
     return out, lse_out
 
 
+# =====================================================================
+# Sparse PREFILL reference (flat bf16 KV).
+#
+# Mirrors DeepSeek FlashMLA's own torch reference `ref_sparse_attn_fwd`
+# (flashmla-src/tests/ref.py) and the `flash_mla_sparse_fwd` API:
+#
+#   q       : [s_q, h_q, d_qk] bf16
+#   kv      : [s_kv, d_qk]     bf16   (already dequantised; V == K, d_v=512)
+#   indices : [s_q, topk]      int32  (-1 or >= s_kv -> invalid/masked)
+#   sm_scale: float
+#   attn_sink   : [h_q] f32, optional (log-domain mix into lse)
+#   topk_length : [s_q] int32, optional (per-query valid prefix)
+#
+# Returns (out[s_q,h_q,d_v] bf16, max_logits[s_q,h_q] f32, lse[s_q,h_q] f32),
+# where max_logits/lse are NATURAL-log domain. lonely queries (no valid
+# token) -> out 0, max_logits -inf, lse +inf. Unlike sparse_decode_reference
+# there is NO page/FP8/E8M0 unpack: KV arrives dense bf16 from sglang's
+# `_forward_prefill_sparse` workspace.
+# =====================================================================
+def sparse_prefill_reference(
+    q: torch.Tensor,                  # [s_q, h_q, d_qk] bf16
+    kv: torch.Tensor,                 # [s_kv, d_qk] bf16
+    indices: torch.Tensor,            # [s_q, topk] int32
+    sm_scale: float,
+    d_v: int = HEAD_DIM_V,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    s_q, h_q, d_qk = q.shape
+    s_kv = kv.size(0)
+    topk = indices.size(-1)
+    assert d_qk == HEAD_DIM_QK and kv.size(-1) == HEAD_DIM_QK
+
+    idx = indices.clone()
+    if topk_length is not None:
+        len_mask = (
+            torch.arange(topk, device=idx.device).unsqueeze(0).broadcast_to(s_q, topk)
+            >= topk_length.unsqueeze(1)
+        )
+        idx[len_mask] = -1
+    invalid = (idx < 0) | (idx >= s_kv)             # [s_q, topk]
+    idx_safe = torch.where(invalid, torch.zeros_like(idx), idx)
+
+    qf = q.float()
+    gathered = kv.index_select(0, idx_safe.flatten().long()).reshape(s_q, topk, d_qk).float()
+    P = (qf @ gathered.transpose(1, 2)) * sm_scale  # [s_q, h_q, topk]
+    P[invalid.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
+
+    orig_lse = torch.logsumexp(P, dim=-1)           # [s_q, h_q]
+    max_logits = P.max(dim=-1).values               # [s_q, h_q]
+
+    if attn_sink is not None:
+        lse_for_o = torch.logsumexp(
+            torch.stack([orig_lse, attn_sink.float().broadcast_to(s_q, h_q)], dim=0), dim=0
+        )
+    else:
+        lse_for_o = orig_lse.clone()
+    lse_for_o[lse_for_o == float("-inf")] = float("+inf")  # -> O row becomes 0
+    s_for_o = torch.exp(P - lse_for_o.unsqueeze(-1))
+    out = s_for_o @ gathered[..., :d_v]             # [s_q, h_q, d_v]
+
+    lonely = orig_lse == float("-inf")
+    orig_lse = orig_lse.clone()
+    orig_lse[lonely] = float("+inf")
+    return out.to(torch.bfloat16), max_logits, orig_lse
+
+
+def make_fake_prefill_batch(
+    s_q: int = 64,
+    h_q: int = 64,
+    s_kv: int = 4096,
+    topk: int = 256,
+    with_topk_length: bool = False,
+    with_attn_sink: bool = False,
+    seed: int = 0,
+    device: str = "cuda",
+):
+    """Random flat-bf16 prefill batch matching the `flash_mla_sparse_fwd`
+    contract (sglang's dequantised workspace).
+
+    Returns q[s_q,h_q,512] bf16, kv[s_kv,512] bf16, indices[s_q,topk] int32,
+    attn_sink[h_q]|None, topk_length[s_q]|None.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    q = torch.randn(s_q, h_q, HEAD_DIM_QK, dtype=torch.bfloat16,
+                    device=device, generator=gen) * 0.1
+    kv = torch.randn(s_kv, HEAD_DIM_QK, dtype=torch.bfloat16,
+                     device=device, generator=gen) * 0.5
+    # Mix in some -1 (invalid) entries alongside in-range gathers.
+    idx = torch.randint(-1, s_kv, (s_q, topk), dtype=torch.int32,
+                        device=device, generator=gen)
+    attn_sink = (
+        torch.randn(h_q, dtype=torch.float32, device=device, generator=gen)
+        if with_attn_sink else None
+    )
+    topk_length = (
+        torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device, generator=gen)
+        if with_topk_length else None
+    )
+    return q, kv, idx, attn_sink, topk_length
+
+
 def make_fake_batch(
     b: int = 2,
     h_q: int = 64,

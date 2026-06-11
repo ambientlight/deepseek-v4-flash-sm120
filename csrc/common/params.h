@@ -96,6 +96,44 @@ struct SparseAttnDecodeParams {
     int num_sm_parts;
 };
 
+// Sparse PREFILL params. Mirrors DeepSeek FlashMLA's `SparseAttnFwdParams`
+// (flashmla-src/csrc/.../params.h): a FLAT bf16 KV workspace gathered by
+// per-query indices, V == K (d_v=512). Unlike the decode params there is no
+// paging / FP8 / E8M0 / extra-KV — sglang pre-dequantises into `kv`.
+struct SparseAttnPrefillParams {
+    int s_q;     // number of query tokens (flattened across the prefill batch)
+    int s_kv;    // number of KV rows in the flat workspace
+    int h_q;
+    int h_kv;    // 1 (MQA/MLA)
+    int d_qk;    // 512
+    int d_v;     // 512
+    int topk;
+    float sm_scale;
+    float sm_scale_div_log2;
+
+    cutlass::bfloat16_t* __restrict__ q;    // [s_q, h_q, d_qk]
+    cutlass::bfloat16_t* __restrict__ kv;   // [s_kv, d_qk]  (h_kv=1, flat bf16)
+    int* __restrict__ indices;              // [s_q, topk]  (-1 / >= s_kv = invalid)
+    float* __restrict__ attn_sink;          // [h_q]  (may be nullptr)
+    int* __restrict__ topk_length;          // [s_q]  (may be nullptr)
+
+    cutlass::bfloat16_t* __restrict__ out;  // [s_q, h_q, d_v]
+    float* __restrict__ max_logits;         // [s_q, h_q]  (natural-log row max)
+    float* __restrict__ lse;                // [s_q, h_q]  (natural log)
+
+    int stride_q_s_q;
+    int stride_q_h_q;
+    int stride_kv_s_kv;
+    int stride_indices_s_q;
+    int stride_o_s_q;
+    int stride_o_h_q;
+    int stride_ml_s_q;   // max_logits / lse share [s_q, h_q] layout
+    int stride_lse_s_q;
+
+    int num_sm;
+    cudaStream_t stream;
+};
+
 // Minimal runtime arch probe (matches upstream naming enough for dispatch).
 struct Arch {
     int major;

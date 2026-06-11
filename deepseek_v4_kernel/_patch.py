@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional, Tuple
 import torch
 
 from .ops import sparse_decode_fwd as _dsv4_sparse_decode_fwd
+from .ops import sparse_prefill_fwd as _dsv4_sparse_prefill_fwd
 
 _log = logging.getLogger("deepseek_v4_kernel.patch_flash_mla")
 _INSTALLED: bool = False
@@ -197,6 +198,65 @@ def _patch_vllm_pkg() -> bool:
     return True
 
 
+def _patch_sgl_kernel_sparse_prefill() -> bool:
+    """Replace ``sgl_kernel.flash_mla.flash_mla_sparse_fwd`` on SM120.
+
+    The stock sparse-prefill op (``torch.ops.sgl_kernel.sparse_prefill_fwd``) is
+    compiled only for SM90a / SM100f and raises on SM120 whenever a prefill
+    batch exceeds ``_LARGE_INDEXER_QUERY_THRESHOLD`` (=11673) query tokens. This
+    swaps in our HMMA tensor-core kernel, which honours the identical
+    ``(out, max_logits, lse)`` contract. Both sglang prefill call-sites
+    (``deepseek_v4_backend._forward_prefill_sparse`` and the DSA backend) do a
+    local ``from sgl_kernel.flash_mla import flash_mla_sparse_fwd``, so patching
+    the module attribute covers both. No-op off SM120.
+    """
+    if not _current_is_sm120():
+        return False
+    try:
+        from sgl_kernel import flash_mla as _sk_flash_mla  # type: ignore
+    except Exception:
+        return False
+    original = getattr(_sk_flash_mla, "flash_mla_sparse_fwd", None)
+    if original is None or getattr(original, "__dsv4_patched__", False):
+        return original is not None
+
+    def flash_mla_sparse_fwd(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        sm_scale: float,
+        d_v: int = 512,
+        attn_sink: Optional[torch.Tensor] = None,
+        topk_length: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        try:
+            return _dsv4_sparse_prefill_fwd(
+                q, kv, indices, float(sm_scale), int(d_v), attn_sink, topk_length
+            )
+        except Exception as exc:  # pragma: no cover
+            if os.environ.get("DSV4_KERNEL_STRICT", "0") == "1":
+                raise
+            _log.warning(
+                "deepseek_v4_kernel sparse prefill failed (%s); falling back to "
+                "the stock sgl_kernel prefill (will raise on SM120).",
+                exc,
+            )
+            return original(
+                q=q,
+                kv=kv,
+                indices=indices,
+                sm_scale=sm_scale,
+                d_v=d_v,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+            )
+
+    flash_mla_sparse_fwd.__wrapped__ = original  # type: ignore[attr-defined]
+    flash_mla_sparse_fwd.__dsv4_patched__ = True  # type: ignore[attr-defined]
+    _sk_flash_mla.flash_mla_sparse_fwd = flash_mla_sparse_fwd
+    return True
+
+
 def _patch_sglang_indexer_fallbacks() -> None:
     """Workaround for sglang's DSv4 C4-indexer fallbacks that assert a 1-D
     ``seq_lens`` even though the caller (``forward_c4_indexer``) unconditionally
@@ -245,6 +305,8 @@ def install() -> None:
     if _patch_flash_mla_pkg():
         patched_any = True
     if _patch_vllm_pkg():
+        patched_any = True
+    if _patch_sgl_kernel_sparse_prefill():
         patched_any = True
     _patch_sglang_indexer_fallbacks()
     if not patched_any:

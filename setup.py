@@ -82,13 +82,21 @@ nvcc_args = [
 if _flag("DSV4_KERNEL_DEBUG"):
     nvcc_args += ["-G"]
 
+# Sparse-prefill kernel: HMMA tensor-core (default) vs scalar reference.
+# Set DSV4_PREFILL_SCALAR=1 to build the CUDA-core reference kernel instead.
+if not _flag("DSV4_PREFILL_SCALAR"):
+    nvcc_args += ["-DDSV4_PREFILL_USE_HMMA"]
+
 ext_modules = [
     CUDAExtension(
         name="deepseek_v4_kernel.cuda",
         sources=[
             str(csrc / "api" / "api.cpp"),
             str(csrc / "api" / "sparse_decode.cpp"),
+            str(csrc / "api" / "sparse_prefill.cpp"),
+            str(csrc / "api" / "moe_gemm.cu"),
             str(csrc / "sm120" / "decode" / "sparse_decode_instantiation.cu"),
+            str(csrc / "sm120" / "prefill" / "sparse_prefill_instantiation.cu"),
         ],
         extra_compile_args={
             "cxx": cxx_args,

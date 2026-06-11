@@ -43,3 +43,30 @@ def sparse_decode_fwd(
         int(d_v),
         float(sm_scale),
     )
+
+
+def sparse_prefill_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Drop-in for ``sgl_kernel.flash_mla.flash_mla_sparse_fwd`` on SM_120.
+
+    q:       [s_q, h_q, d_qk] bf16
+    kv:      [s_kv, h_kv=1, d_qk] or [s_kv, d_qk] bf16 (flat, dequantised)
+    indices: [s_q, h_kv=1, topk] or [s_q, topk] int32 (-1 / >= s_kv = invalid)
+    Returns (out[s_q,h_q,d_v] bf16, max_logits[s_q,h_q] f32, lse[s_q,h_q] f32).
+    """
+    return _cuda.sparse_prefill_fwd(
+        q,
+        kv,
+        indices,
+        float(sm_scale),
+        int(d_v),
+        attn_sink,
+        topk_length,
+    )
